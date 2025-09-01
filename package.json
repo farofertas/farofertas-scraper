@@ -1,0 +1,13 @@
+{
+  "name": "farofertas-scraper",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node api/scrape.js"
+  },
+  "dependencies": {
+    "@sparticuz/chromium": "^123.0.0",
+    "puppeteer-core": "^22.12.1"
+  }
+}
