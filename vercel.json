@@ -1,3 +1,11 @@
 {
-  "version": 2
+  "version": 2,
+  "functions": {
+    "api/*.js": {
+      "runtime": "nodejs20.x",
+      "memory": 1536,
+      "maxDuration": 90,
+      "includeFiles": "node_modules/@sparticuz/chromium/**/*"
+    }
+  }
 }
