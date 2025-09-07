@@ -1,5 +1,7 @@
 // api/scraper.js
 import puppeteer from "puppeteer";
+import fs from "fs";
+import path from "path";
 
 // ----- utils -----
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -11,6 +13,31 @@ const sanitizeNumber = (txt) => {
   const n = Number(normalized);
   return Number.isFinite(n) ? n : null;
 };
+
+async function getChromePath() {
+  // 1) Caminho padrão reportado pelo Puppeteer
+  try {
+    const p = puppeteer.executablePath?.();
+    if (p && fs.existsSync(p)) return p;
+  } catch {}
+
+  // 2) Varre o cache do Render
+  const base = process.env.PUPPETEER_CACHE_DIR || "/opt/render/.cache/puppeteer";
+  try {
+    const chromeDir = path.join(base, "chrome");
+    const versions = fs.readdirSync(chromeDir).sort().reverse(); // versões mais novas primeiro
+    for (const v of versions) {
+      const candidates = [
+        path.join(chromeDir, v, "chrome-linux64", "chrome"),
+        path.join(chromeDir, v, "chrome-linux", "chrome")
+      ];
+      for (const c of candidates) {
+        if (fs.existsSync(c)) return c;
+      }
+    }
+  } catch {}
+  return null;
+}
 
 async function extractJSONLD(page) {
   try {
@@ -148,9 +175,18 @@ export default async function handler(req, res) {
 
   let browser;
   try {
+    const chromePath = await getChromePath();
+    if (!chromePath) {
+      return res.status(500).json({
+        success: false,
+        error:
+          "Chrome não encontrado no host. Refaça o deploy com Build Command: `npm install && npx puppeteer browsers install chrome`."
+      });
+    }
+
     browser = await puppeteer.launch({
       headless: true,
-      executablePath: puppeteer.executablePath(), // usa o Chrome baixado no build
+      executablePath: chromePath,
       args: [
         "--no-sandbox",
         "--disable-setuid-sandbox",
@@ -219,3 +255,4 @@ export default async function handler(req, res) {
     if (browser) { try { await browser.close(); } catch {} }
   }
 }
+
