@@ -5,7 +5,8 @@
   "type": "module",
   "engines": { "node": "20.x" },
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "postinstall": "npx puppeteer browsers install chrome"
   },
   "dependencies": {
     "body-parser": "^1.20.2",
