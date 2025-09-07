@@ -2,9 +2,12 @@
 import puppeteer from "puppeteer";
 import fs from "fs";
 import path from "path";
+import { install, computeExecutablePath } from "@puppeteer/browsers";
 
 // ----- utils -----
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const CACHE_DIR = process.env.PUPPETEER_CACHE_DIR || "/opt/render/.cache/puppeteer";
+const BUILD_ID = process.env.PUPPETEER_BUILD_ID || "stable"; // pode fixar uma versão se quiser
 
 const sanitizeNumber = (txt) => {
   if (!txt) return null;
@@ -14,29 +17,39 @@ const sanitizeNumber = (txt) => {
   return Number.isFinite(n) ? n : null;
 };
 
-async function getChromePath() {
-  // 1) Caminho padrão reportado pelo Puppeteer
+async function ensureChromePath() {
+  // 1) Caminho padrão (puppeteer já sabe)
   try {
     const p = puppeteer.executablePath?.();
     if (p && fs.existsSync(p)) return p;
   } catch {}
 
-  // 2) Varre o cache do Render
-  const base = process.env.PUPPETEER_CACHE_DIR || "/opt/render/.cache/puppeteer";
+  // 2) Caminho computado pelo pacote @puppeteer/browsers (sem baixar)
   try {
-    const chromeDir = path.join(base, "chrome");
-    const versions = fs.readdirSync(chromeDir).sort().reverse(); // versões mais novas primeiro
-    for (const v of versions) {
-      const candidates = [
-        path.join(chromeDir, v, "chrome-linux64", "chrome"),
-        path.join(chromeDir, v, "chrome-linux", "chrome")
-      ];
-      for (const c of candidates) {
-        if (fs.existsSync(c)) return c;
-      }
-    }
+    const computed = computeExecutablePath({
+      cacheDir: CACHE_DIR,
+      browser: "chrome",
+      buildId: BUILD_ID,
+      platform: process.platform === "linux" ? "linux" : "linux", // Render = linux
+      basePath: undefined
+    });
+    if (computed && fs.existsSync(computed)) return computed;
   } catch {}
-  return null;
+
+  // 3) Baixa em runtime (fallback) e retorna o caminho
+  await install({
+    browser: "chrome",
+    cacheDir: CACHE_DIR,
+    buildId: BUILD_ID
+  });
+  const computedAfter = computeExecutablePath({
+    cacheDir: CACHE_DIR,
+    browser: "chrome",
+    buildId: BUILD_ID,
+    platform: "linux",
+    basePath: undefined
+  });
+  return computedAfter;
 }
 
 async function extractJSONLD(page) {
@@ -84,7 +97,7 @@ async function extractMeta(page) {
     (await get("meta[property='product:price:amount']")) ||
     (await get("meta[name='twitter:data1']"));
   const currency =
-    (await get("meta[itemprop='priceCurrency']")) ||
+    (await get("meta[itemprop='priceCurrency']") )||
     (await get("meta[property='product:price:currency']")) ||
     "BRL";
 
@@ -175,12 +188,11 @@ export default async function handler(req, res) {
 
   let browser;
   try {
-    const chromePath = await getChromePath();
+    const chromePath = await ensureChromePath();
     if (!chromePath) {
       return res.status(500).json({
         success: false,
-        error:
-          "Chrome não encontrado no host. Refaça o deploy com Build Command: `npm install && npx puppeteer browsers install chrome`."
+        error: "Chrome não encontrado e não foi possível instalar."
       });
     }
 
