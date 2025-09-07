@@ -267,4 +267,3 @@ export default async function handler(req, res) {
     if (browser) { try { await browser.close(); } catch {} }
   }
 }
-
