@@ -9,6 +9,7 @@
     "postinstall": "npx puppeteer browsers install chrome"
   },
   "dependencies": {
+    "@puppeteer/browsers": "^2.2.3",
     "body-parser": "^1.20.2",
     "express": "^4.19.2",
     "puppeteer": "^22.12.1"
