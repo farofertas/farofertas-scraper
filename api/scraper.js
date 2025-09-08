@@ -4,10 +4,10 @@ import fs from "fs";
 import path from "path";
 import { install, computeExecutablePath } from "@puppeteer/browsers";
 
-// ----- utils -----
+// ===== utils =====
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const CACHE_DIR = process.env.PUPPETEER_CACHE_DIR || "/opt/render/.cache/puppeteer";
-const BUILD_ID = process.env.PUPPETEER_BUILD_ID || "stable"; // pode fixar uma versão se quiser
+const BUILD_ID = process.env.PUPPETEER_BUILD_ID || "stable";
 
 const sanitizeNumber = (txt) => {
   if (!txt) return null;
@@ -18,30 +18,23 @@ const sanitizeNumber = (txt) => {
 };
 
 async function ensureChromePath() {
-  // 1) Caminho padrão (puppeteer já sabe)
   try {
     const p = puppeteer.executablePath?.();
     if (p && fs.existsSync(p)) return p;
   } catch {}
 
-  // 2) Caminho computado pelo pacote @puppeteer/browsers (sem baixar)
   try {
     const computed = computeExecutablePath({
       cacheDir: CACHE_DIR,
       browser: "chrome",
       buildId: BUILD_ID,
-      platform: process.platform === "linux" ? "linux" : "linux", // Render = linux
+      platform: "linux",
       basePath: undefined
     });
     if (computed && fs.existsSync(computed)) return computed;
   } catch {}
 
-  // 3) Baixa em runtime (fallback) e retorna o caminho
-  await install({
-    browser: "chrome",
-    cacheDir: CACHE_DIR,
-    buildId: BUILD_ID
-  });
+  await install({ browser: "chrome", cacheDir: CACHE_DIR, buildId: BUILD_ID });
   const computedAfter = computeExecutablePath({
     cacheDir: CACHE_DIR,
     browser: "chrome",
@@ -97,7 +90,7 @@ async function extractMeta(page) {
     (await get("meta[property='product:price:amount']")) ||
     (await get("meta[name='twitter:data1']"));
   const currency =
-    (await get("meta[itemprop='priceCurrency']") )||
+    (await get("meta[itemprop='priceCurrency']")) ||
     (await get("meta[property='product:price:currency']")) ||
     "BRL";
 
@@ -110,7 +103,7 @@ async function extractMeta(page) {
   };
 }
 
-// ----- domain scrapers -----
+// ===== domain scrapers =====
 async function scrapeShopee(page) {
   const sels = [
     "[data-testid='lblProductPrice']",
@@ -164,7 +157,7 @@ async function scrapeAmazon(page) {
   return { price: null, currency: "BRL" };
 }
 
-// ----- HTTP handler -----
+// ===== HTTP handler =====
 export default async function handler(req, res) {
   // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -207,15 +200,87 @@ export default async function handler(req, res) {
     });
 
     const page = await browser.newPage();
+    await page.setViewport({ width: 1366, height: 768 });
+    await page.setJavaScriptEnabled(true);
     await page.setUserAgent(
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
     );
-    await page.setExtraHTTPHeaders({ "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8" });
+    await page.setExtraHTTPHeaders({
+      "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+      "Upgrade-Insecure-Requests": "1"
+    });
 
-    await page.goto(parsed.toString(), { waitUntil: "domcontentloaded", timeout: 60000 });
+    // ---- navegação com retries e fallback ----
+    const tryGoto = async (pg, urlStr) => {
+      const resp = await pg.goto(urlStr, { waitUntil: "domcontentloaded", timeout: 60000 });
+      const status = resp ? resp.status() : 0;
+      return { status, finalURL: pg.url() };
+    };
+
+    let { status, finalURL } = await tryGoto(page, parsed.toString());
+
+    // Retry 1: alterna www/non-www se 404
+    if (status === 404) {
+      const alt = new URL(parsed.toString());
+      alt.hostname = /^www\./i.test(parsed.hostname)
+        ? parsed.hostname.replace(/^www\./i, "")
+        : `www.${parsed.hostname}`;
+      ({ status, finalURL } = await tryGoto(page, alt.toString()));
+    }
+
+    // Retry 2: outro UA se ainda 403/404/406
+    if ([403, 404, 406].includes(status)) {
+      await page.setUserAgent(
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15"
+      );
+      ({ status, finalURL } = await tryGoto(page, parsed.toString()));
+    }
+
+    // Fallback estático: pega só <title> via fetch se ainda falhar
+    if (status >= 400 || status === 0) {
+      try {
+        const r = await fetch(parsed.toString(), {
+          headers: {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+            "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+          }
+        });
+        const txt = await r.text();
+        const m = txt.match(/<title[^>]*>([^<]+)<\/title>/i);
+        const titleOnly = m ? m[1].trim() : "Página";
+
+        const outURL = new URL(parsed.toString());
+        const host = outURL.hostname;
+        const isShopee = /(^|\.)shopee\./i.test(host);
+
+        if (!isShopee && utm_source && !outURL.searchParams.get("utm_source")) {
+          outURL.searchParams.set("utm_source", utm_source);
+          outURL.searchParams.set("utm_medium", "referral");
+          outURL.searchParams.set("utm_campaign", "farofertas");
+        }
+
+        return res.status(200).json({
+          success: true,
+          domain: host,
+          title: titleOnly,
+          price: null,
+          currency: "BRL",
+          image: null,
+          availability: null,
+          affiliate_url: outURL.toString(),
+          note: `Fallback estático (status original ${status})`
+        });
+      } catch (e) {
+        return res.status(502).json({
+          success: false,
+          error: `Destino respondeu ${status} e fallback falhou: ${e?.message || e}`
+        });
+      }
+    }
+
+    // ---- extrações normais (quando navegou com sucesso) ----
     await sleep(2000 + Math.min(Math.max(+extra_wait_ms || 0, 0), 5000));
-
-    const finalURL = page.url();
     const host = new URL(finalURL).hostname;
 
     const [ld, meta] = await Promise.all([extractJSONLD(page), extractMeta(page)]);
@@ -242,7 +307,11 @@ export default async function handler(req, res) {
     if (price != null && !Number.isFinite(price)) price = null;
 
     const outURL = new URL(finalURL);
-    if (utm_source && !outURL.searchParams.get("utm_source")) {
+    const isShopee = /(^|\.)shopee\./i.test(host);
+    const shouldAddUtm =
+      !isShopee && utm_source && !outURL.searchParams.get("utm_source");
+
+    if (shouldAddUtm) {
       outURL.searchParams.set("utm_source", utm_source);
       outURL.searchParams.set("utm_medium", "referral");
       outURL.searchParams.set("utm_campaign", "farofertas");
@@ -264,6 +333,8 @@ export default async function handler(req, res) {
       error: err?.message || "erro desconhecido no scraper"
     });
   } finally {
-    if (browser) { try { await browser.close(); } catch {} }
+    // fecha o browser
+    try { if (browser) await browser.close(); } catch {}
   }
 }
+
