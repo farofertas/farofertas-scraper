@@ -1,6 +1,10 @@
 // api/scraper.js
-// Fetch-only (sem headless). Suporte completo a shortlinks da Shopee, preservando o link afiliado original.
-// Retorna também `template_line` e `template_caption` prontos.
+// Fetch-only (sem headless) com:
+// - Suporte a shortlinks Shopee (s.shopee.com.br, shope.ee) → resolve redirects
+// - Descoberta de shopid/itemid (pela URL OU pelo HTML)
+// - Shopee JSON API para título/preço quando possível
+// - Preserva SEMPRE o link original enviado (shortlink) no affiliate_url
+// - Retorna templates prontos (template_line, template_caption)
 
 const UA_CHROME =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36";
@@ -17,7 +21,7 @@ const HEADERS_JSON = {
   "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8"
 };
 
-// ---------- helpers ----------
+// ---------- helpers gerais ----------
 const sanitizeNumber = (txt) => {
   if (!txt) return null;
   const only = txt.replace(/\s/g, "").replace(/[^\d,.-]/g, "");
@@ -25,31 +29,28 @@ const sanitizeNumber = (txt) => {
   const n = Number(normalized);
   return Number.isFinite(n) ? n : null;
 };
-const extractBetween = (html, re) => {
-  const m = html.match(re);
-  return m ? m[1].trim() : null;
-};
+const extractBetween = (html, re) => (html.match(re)?.[1]?.trim() ?? null);
 const parseTitle = (html) =>
   extractBetween(html, /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["'][^>]*>/i) ||
   extractBetween(html, /<title[^>]*>([^<]+)<\/title>/i) || null;
 const parseOgImage = (html) =>
   extractBetween(html, /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["'][^>]*>/i);
 const parseMetaPrice = (html) => {
-  const itemprop = extractBetween(html, /<meta[^>]+itemprop=["']price["'][^>]+content=["']([^"']+)["'][^>]*>/i);
-  if (itemprop) return sanitizeNumber(itemprop);
-  const productAmount = extractBetween(html, /<meta[^>]+property=["']product:price:amount["'][^>]+content=["']([^"']+)["'][^>]*>/i);
-  if (productAmount) return sanitizeNumber(productAmount);
-  const twitterData1 = extractBetween(html, /<meta[^>]+name=["']twitter:data1["'][^>]+content=["']([^"']+)["'][^>]*>/i);
-  if (twitterData1) return sanitizeNumber(twitterData1);
-  const br = extractBetween(html, /R\$\s*([\d\.\,]+)/i);
-  if (br) return sanitizeNumber(br);
+  const v1 = extractBetween(html, /<meta[^>]+itemprop=["']price["'][^>]+content=["']([^"']+)["'][^>]*>/i);
+  if (v1) return sanitizeNumber(v1);
+  const v2 = extractBetween(html, /<meta[^>]+property=["']product:price:amount["'][^>]+content=["']([^"']+)["'][^>]*>/i);
+  if (v2) return sanitizeNumber(v2);
+  const v3 = extractBetween(html, /<meta[^>]+name=["']twitter:data1["'][^>]+content=["']([^"']+)["'][^>]*>/i);
+  if (v3) return sanitizeNumber(v3);
+  const v4 = extractBetween(html, /R\$\s*([\d\.\,]+)/i);
+  if (v4) return sanitizeNumber(v4);
   return null;
 };
 const parseMetaCurrency = (html) => {
-  const itemprop = extractBetween(html, /<meta[^>]+itemprop=["']priceCurrency["'][^>]+content=["']([^"']+)["'][^>]*>/i);
-  if (itemprop) return itemprop.toUpperCase();
-  const productCurrency = extractBetween(html, /<meta[^>]+property=["']product:price:currency["'][^>]+content=["']([^"']+)["'][^>]*>/i);
-  if (productCurrency) return productCurrency.toUpperCase();
+  const c1 = extractBetween(html, /<meta[^>]+itemprop=["']priceCurrency["'][^>]+content=["']([^"']+)["'][^>]*>/i);
+  if (c1) return c1.toUpperCase();
+  const c2 = extractBetween(html, /<meta[^>]+property=["']product:price:currency["'][^>]+content=["']([^"']+)["'][^>]*>/i);
+  if (c2) return c2.toUpperCase();
   return "BRL";
 };
 function parseJSONLD(html) {
@@ -79,6 +80,22 @@ function parseJSONLD(html) {
   }
   return out;
 }
+function formatBRL(value, currency = "BRL") {
+  try { return new Intl.NumberFormat("pt-BR", { style: "currency", currency }).format(value); }
+  catch { return `R$ ${Number(value).toFixed(2).replace(".", ",")}`; }
+}
+function buildTemplates({ title, price, currency, affiliateUrl }) {
+  const hasPrice = typeof price === "number" && Number.isFinite(price);
+  const priceTxt = hasPrice ? formatBRL(price, currency || "BRL") : null;
+  const safeTitle = title || "Produto";
+  const template_line = hasPrice
+    ? `${safeTitle} por ${priceTxt} ➜ ${affiliateUrl}`
+    : `${safeTitle} ➜ ${affiliateUrl}`;
+  const template_caption = hasPrice
+    ? `🔥 ${safeTitle}\npor ${priceTxt}\n${affiliateUrl}`
+    : `🔥 ${safeTitle}\n${affiliateUrl}`;
+  return { template_line, template_caption };
+}
 
 // ---------- Shopee ----------
 const SHOPEE_ITEM_API = "https://shopee.com.br/api/v4/item/get";
@@ -93,27 +110,33 @@ function parseShopeeIdsFromUrl(urlStr) {
   } catch { return null; }
 }
 
+// Se não houver IDs na URL, tenta achar no HTML (JSON inline)
+function extractShopeeIdsFromHtml(html) {
+  let m = html.match(/(?:^|[^\w])i\.(\d+)\.(\d+)(?:[^\d]|$)/i);
+  if (m) return { shopid: m[1], itemid: m[2] };
+  const shop = html.match(/"shopid"\s*:\s*(\d+)/i);
+  const item = html.match(/"itemid"\s*:\s*(\d+)/i);
+  if (shop && item) return { shopid: shop[1], itemid: item[1] };
+  const shop2 = html.match(/shopid\s*:\s*(\d+)/i);
+  const item2 = html.match(/itemid\s*:\s*(\d+)/i);
+  if (shop2 && item2) return { shopid: shop2[1], itemid: item2[1] };
+  return null;
+}
+
 async function resolveRedirects(urlStr, maxHops = 10) {
   let current = urlStr;
   for (let i = 0; i < maxHops; i++) {
     const u = new URL(current);
     const isShort = isShopeeShortHost(u.hostname);
-
     const r = await fetch(current, {
       method: "GET",
       redirect: "manual",
       headers: { ...HEADERS_HTML, Referer: isShort ? "https://shopee.com.br/" : u.origin + "/" }
     });
-
     const status = r.status;
     const loc = r.headers.get("location");
     const isDeep = loc && /^shopee:\/\//i.test(loc);
-
-    if (loc && !isDeep) {
-      current = new URL(loc, current).toString();
-      continue;
-    }
-
+    if (loc && !isDeep) { current = new URL(loc, current).toString(); continue; }
     const html = await r.text().catch(() => "");
     const mRefresh = html.match(/http-equiv=["']refresh["'][^>]*content=["'][^"']*url=([^"'>]+)["']/i);
     if (mRefresh) { current = new URL(mRefresh[1], current).toString(); continue; }
@@ -121,7 +144,6 @@ async function resolveRedirects(urlStr, maxHops = 10) {
     if (mCanonical) { current = new URL(mCanonical[1], current).toString(); continue; }
     const mOg = html.match(/<meta[^>]+property=["']og:url["'][^>]+content=["']([^"']+)["']/i);
     if (mOg) { current = new URL(mOg[1], current).toString(); continue; }
-
     if (status >= 200 && status < 300) return current;
     if (status >= 300 && status < 400 && !loc) return current;
     return current;
@@ -136,36 +158,13 @@ async function fetchShopeeItem(shopid, itemid, originalUrl) {
   const j = await r.json();
   const d = j?.data;
   if (!d) throw new Error("Shopee API sem data");
-
   const micro = d.price ?? d.price_min ?? d.price_max ??
     (typeof d.price_min_before_discount === "number" ? d.price_min_before_discount : null);
   const price = (typeof micro === "number") ? micro / 100000 : null;
-
   const title = d.name || null;
   const image = Array.isArray(d.images) && d.images[0] ? `https://cf.shopee.com.br/file/${d.images[0]}` : null;
   const availability = (typeof d.stock === "number") ? (d.stock > 0 ? "InStock" : "OutOfStock") : null;
-
   return { title, price, image, availability, currency: "BRL" };
-}
-
-// ---------- templates ----------
-function formatBRL(value, currency = "BRL") {
-  try { return new Intl.NumberFormat("pt-BR", { style: "currency", currency }).format(value); }
-  catch { return `R$ ${Number(value).toFixed(2).replace(".", ",")}`; }
-}
-function buildTemplates({ title, price, currency, affiliateUrl }) {
-  const hasPrice = typeof price === "number" && Number.isFinite(price);
-  const priceTxt = hasPrice ? formatBRL(price, currency || "BRL") : null;
-
-  const template_line = hasPrice
-    ? `${title} por ${priceTxt} ➜ ${affiliateUrl}`
-    : `${title} ➜ ${affiliateUrl}`;
-
-  const template_caption = hasPrice
-    ? `🔥 ${title}\npor ${priceTxt}\n${affiliateUrl}`
-    : `🔥 ${title}\n${affiliateUrl}`;
-
-  return { template_line, template_caption };
 }
 
 // ---------- handler ----------
@@ -186,24 +185,35 @@ export default async function handler(req, res) {
     if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("invalid");
   } catch { res.status(400).json({ success: false, error: "invalid url" }); return; }
 
-  const originalAffiliateUrl = url; // preserva teu link curto
+  const originalAffiliateUrl = url; // preserva seu shortlink
 
   try {
-    // 1) Se for encurtador da Shopee, resolve primeiro
+    // 1) Shortlink da Shopee? Resolve primeiro
     if (isShopeeShortHost(parsed.hostname)) {
       const finalStr = await resolveRedirects(parsed.toString(), 10);
       parsed = new URL(finalStr);
     }
 
-    // 2) Shopee com shopid/itemid → usa API JSON (dados) e devolve o link original no affiliate_url
+    // 2) Shopee → tentar IDs por URL OU HTML; se obter, usar API JSON (dados) e devolver o link original
     const host = parsed.hostname;
     if (/(^|\.)shopee\./i.test(host)) {
-      const ids = parseShopeeIdsFromUrl(parsed.toString());
+      // (a) tenta IDs na URL
+      let ids = parseShopeeIdsFromUrl(parsed.toString());
+
+      // (b) se não houver IDs na URL, tenta extrair do HTML
+      let htmlForIds = null;
+      if (!ids) {
+        const rForIds = await fetch(parsed.toString(), { headers: HEADERS_HTML });
+        htmlForIds = await rForIds.text().catch(() => "");
+        ids = extractShopeeIdsFromHtml(htmlForIds || "");
+      }
+
       if (ids) {
         try {
           const data = await fetchShopeeItem(ids.shopid, ids.itemid, parsed.toString());
+          const safeTitle = data.title || "Produto Shopee";
           const { template_line, template_caption } = buildTemplates({
-            title: data.title || "Produto",
+            title: safeTitle,
             price: data.price ?? null,
             currency: data.currency || "BRL",
             affiliateUrl: originalAffiliateUrl
@@ -211,21 +221,42 @@ export default async function handler(req, res) {
           res.status(200).json({
             success: true,
             domain: host,
-            title: data.title || "Produto",
+            title: safeTitle,
             price: data.price ?? null,
             currency: data.currency || "BRL",
             image: data.image || null,
             availability: data.availability || null,
-            affiliate_url: originalAffiliateUrl, // mantém seu encurtador
+            affiliate_url: originalAffiliateUrl, // mantém teu shortlink
             template_line,
             template_caption,
-            note: "Shopee JSON API (dados via URL expandida, link afiliado preservado)"
+            note: "Shopee JSON API (IDs via URL/HTML; link afiliado preservado)"
           });
           return;
-        } catch (e) {
-          // cai pro fetch HTML genérico se a API pública não responder
+        } catch {
+          // cai no fallback HTML abaixo
         }
       }
+
+      // (c) fallback só pra título (se nada acima funcionou)
+      const html = htmlForIds || (await (await fetch(parsed.toString(), { headers: HEADERS_HTML })).text().catch(() => ""));
+      const titleFallback = parseTitle(html) || "Produto Shopee";
+      const { template_line, template_caption } = buildTemplates({
+        title: titleFallback, price: null, currency: "BRL", affiliateUrl: originalAffiliateUrl
+      });
+      res.status(200).json({
+        success: true,
+        domain: host,
+        title: titleFallback,
+        price: null,
+        currency: "BRL",
+        image: null,
+        availability: null,
+        affiliate_url: originalAffiliateUrl,
+        template_line,
+        template_caption,
+        note: "Fallback HTML Shopee (sem IDs)"
+      });
+      return;
     }
 
     // 3) Fluxo genérico (outros domínios)
@@ -250,8 +281,9 @@ export default async function handler(req, res) {
     const outURL = new URL(parsed.toString());
     const isShopee = /(^|\.)shopee\./i.test(outURL.hostname);
 
+    // Para Shopee, mantém o link original; para outros domínios, adiciona UTM se faltar
     const affiliate_url = isShopee
-      ? originalAffiliateUrl // Shopee: sempre devolve o link que você enviou
+      ? originalAffiliateUrl
       : (() => {
           if (utm_source && !outURL.searchParams.get("utm_source")) {
             outURL.searchParams.set("utm_source", utm_source);
@@ -262,10 +294,7 @@ export default async function handler(req, res) {
         })();
 
     const { template_line, template_caption } = buildTemplates({
-      title,
-      price,
-      currency,
-      affiliateUrl: affiliate_url
+      title, price, currency, affiliateUrl: affiliate_url
     });
 
     res.status(200).json({
@@ -284,5 +313,4 @@ export default async function handler(req, res) {
     res.status(502).json({ success: false, error: err?.message || "fetch failed" });
   }
 }
-
 
