@@ -1,10 +1,8 @@
 // api/scraper.js
-// Objetivo: usar SEMPRE a URL que você mandou no template (affiliate_url),
-// mas buscar o TÍTULO na URL FINAL (após redirecionamentos).
-// - Resolve shortlinks (ex.: s.shopee.com.br, shope.ee) e outros redirects
-// - Lê <title>/og:title e tenta JSON-LD para pegar nome/preço
-// - Se ainda faltar, tenta extrair título pelo SLUG da URL final
-// - Nunca troca o link no template: mantém a URL original enviada
+// 1) Resolve redirects e lê HTML da URL FINAL.
+// 2) Se for Shopee, extrai shopid/itemid de múltiplos padrões (inclui /opaanlp/{shopid}/{itemid})
+//    e chama a API JSON para obter TÍTULO/PREÇO. Se não rolar, usa <title>/og:title ou slug.
+// 3) SEMPRE preserva a URL ORIGINAL enviada (shortlink) em affiliate_url.
 
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36";
@@ -16,6 +14,12 @@ const HTML_HEADERS = {
   "Upgrade-Insecure-Requests": "1"
 };
 
+const JSON_HEADERS = {
+  "User-Agent": UA,
+  "Accept": "application/json, text/plain, */*",
+  "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8"
+};
+
 function isShopeeHost(h) {
   return /(^|\.)shopee\./i.test(h) || /(^|\.)s\.shopee\.com\.br$/i.test(h) || /(^|\.)shope\.ee$/i.test(h);
 }
@@ -23,8 +27,7 @@ function isShopeeHost(h) {
 function sanitizeTitle(t) {
   if (!t) return null;
   const s = String(t).trim();
-  // evita “título” que seja só número (ex.: itemid)
-  if (/^\d{6,}$/.test(s)) return null;
+  if (/^\d{6,}$/.test(s)) return null; // evita só números
   return s;
 }
 
@@ -53,10 +56,13 @@ function parseTitleFromHTML(html) {
   return null;
 }
 
-function parseCanonicalOrOgUrl(html) {
+function parseCanonicalOrOgUrl(html, baseUrl) {
   const canon = html.match(/<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["']/i)?.[1];
   const og = html.match(/<meta[^>]+property=["']og:url["'][^>]+content=["']([^"']+)["']/i)?.[1];
-  return canon || og || null;
+  const cand = canon || og;
+  if (!cand) return null;
+  try { return new URL(cand, baseUrl).toString(); }
+  catch { return null; }
 }
 
 function titleFromSlug(urlStr) {
@@ -86,57 +92,99 @@ function titleFromSlug(urlStr) {
   }
 }
 
-function tryParseJSONLD(html) {
-  // retorna { title, price } quando possível (bem básico)
-  const scripts = [...html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)];
-  let title = null;
-  let price = null;
-  for (const m of scripts) {
-    try {
-      const raw = (m[1] || "").trim();
-      if (!raw) continue;
-      const data = JSON.parse(raw);
-      const arr = Array.isArray(data) ? data : [data];
-      for (const item of arr) {
-        if (!title && (item?.name || item?.headline)) {
-          title = sanitizeTitle(item.name || item.headline);
-        }
-        const offers = item?.offers
-          ? (Array.isArray(item.offers) ? item.offers : [item.offers])
-          : [];
-        for (const off of offers) {
-          if (price == null && (off?.price ?? off?.lowPrice ?? off?.highPrice)) {
-            const v = Number(String(off.price ?? off.lowPrice ?? off.highPrice).replace(/[^\d.,-]/g, "").replace(/\./g, "").replace(",", "."));
-            if (Number.isFinite(v)) price = v;
-          }
-        }
+// --------- Shopee IDs ---------
+// Suporta: -i.shopid.itemid | /product/shopid/itemid | /opaanlp/shopid/itemid | genérico: dois segmentos numéricos seguidos
+function parseShopeeIdsFromUrl(urlStr) {
+  try {
+    const u = new URL(urlStr);
+    const p = u.pathname;
+
+    // ...-i.shopid.itemid
+    let m = p.match(/(?:-|\/)i\.([0-9]+)\.([0-9]+)/i);
+    if (m) return { shopid: m[1], itemid: m[2] };
+
+    // /product/shopid/itemid
+    m = p.match(/\/product\/([0-9]+)\/([0-9]+)/i);
+    if (m) return { shopid: m[1], itemid: m[2] };
+
+    // /opaanlp/shopid/itemid (e variações de “nlp/affiliate/outlink”)
+    m = p.match(/\/(?:opaanlp|affiliate|applink|nlp|out|outlink)\/([0-9]+)\/([0-9]+)(?:[\/\?#]|$)/i);
+    if (m) return { shopid: m[1], itemid: m[2] };
+
+    // Genérico: dois segmentos numéricos consecutivos → retorna ambos para tentar
+    const segs = p.split("/").filter(Boolean);
+    for (let i = 0; i < segs.length - 1; i++) {
+      if (/^\d+$/.test(segs[i]) && /^\d+$/.test(segs[i + 1])) {
+        return { shopid: segs[i], itemid: segs[i + 1], ambiguous: true };
       }
-    } catch {}
+    }
+
+    return null;
+  } catch {
+    return null;
   }
+}
+
+// Do HTML (inclui *_str)
+function extractShopeeIdsFromHtml(html) {
+  let m = html.match(/(?:^|[^\w])i\.(\d+)\.(\d+)(?:[^\d]|$)/i);
+  if (m) return { shopid: m[1], itemid: m[2] };
+  const shop1 = html.match(/"shopid"\s*:\s*(\d+)/i)?.[1];
+  const item1 = html.match(/"itemid"\s*:\s*(\d+)/i)?.[1];
+  if (shop1 && item1) return { shopid: shop1, itemid: item1 };
+  const shop2 = html.match(/"shopid_str"\s*:\s*"(\d+)"/i)?.[1];
+  const item2 = html.match(/"itemid_str"\s*:\s*"(\d+)"/i)?.[1];
+  if (shop2 && item2) return { shopid: shop2, itemid: item2 };
+  return null;
+}
+
+async function fetchShopeeItem(shopid, itemid, refererUrl) {
+  const apiUrl = `https://shopee.com.br/api/v4/item/get?itemid=${itemid}&shopid=${shopid}`;
+  const r = await fetch(apiUrl, { headers: { ...JSON_HEADERS, Referer: refererUrl } });
+  if (!r.ok) throw new Error(`Shopee API ${r.status}`);
+  const j = await r.json();
+  const d = j?.data;
+  if (!d) throw new Error("Shopee API sem data");
+  const micro = typeof d.price === "number" ? d.price : null;
+  const price = micro != null ? micro / 100000 : null;
+  const title = d.name || null;
   return { title, price };
 }
 
-async function resolveFinal(urlStr, refererHost) {
-  // 1) tenta seguir redirects automaticamente
+// Tenta a API na ordem informada; se falhar e pair parecer ambíguo, tenta invertido.
+async function resolveShopeeTitlePrice(ids, refererUrl) {
+  if (!ids) return { title: null, price: null };
+  const tryPairs = [];
+  if (ids.ambiguous) {
+    tryPairs.push({ shopid: ids.shopid, itemid: ids.itemid });
+    tryPairs.push({ shopid: ids.itemid, itemid: ids.shopid }); // swap
+  } else {
+    tryPairs.push({ shopid: ids.shopid, itemid: ids.itemid });
+  }
+  for (const pair of tryPairs) {
+    try {
+      const data = await fetchShopeeItem(pair.shopid, pair.itemid, refererUrl);
+      return { title: sanitizeTitle(data.title), price: data.price };
+    } catch { /* tenta próxima combinação */ }
+  }
+  return { title: null, price: null };
+}
+
+// --------- Redirect/HTML ---------
+function parseCanonicalOrOgUrlOnly(html) {
+  const canon = html.match(/<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["']/i)?.[1];
+  const og = html.match(/<meta[^>]+property=["']og:url["'][^>]+content=["']([^"']+)["']/i)?.[1];
+  return canon || og || null;
+}
+
+async function resolveFinal(urlStr) {
   try {
-    const r = await fetch(urlStr, {
-      method: "GET",
-      redirect: "follow",
-      headers: { ...HTML_HEADERS, ...(refererHost ? { Referer: `https://${refererHost}/` } : {}) }
-    });
-    const urlFollow = r.url || urlStr;
-    const htmlFollow = await r.text().catch(() => "");
-    // 2) se o HTML tiver canonical/og:url, pode apontar melhor a URL final
-    const hinted = parseCanonicalOrOgUrl(htmlFollow);
-    if (hinted) {
-      try {
-        const u2 = new URL(hinted, urlFollow);
-        return { finalUrl: u2.toString(), html: htmlFollow };
-      } catch { /* ignora hinted inválido */ }
-    }
-    return { finalUrl: urlFollow, html: htmlFollow };
+    const r = await fetch(urlStr, { method: "GET", redirect: "follow", headers: HTML_HEADERS });
+    const finalUrl = r.url || urlStr;
+    const html = await r.text().catch(() => "");
+    const hinted = parseCanonicalOrOgUrlOnly(html) || finalUrl;
+    return { finalUrl: hinted, html };
   } catch {
-    // fallback: tenta pegar ao menos o HTML
     try {
       const r2 = await fetch(urlStr, { headers: HTML_HEADERS });
       const html2 = await r2.text().catch(() => "");
@@ -147,6 +195,7 @@ async function resolveFinal(urlStr, refererHost) {
   }
 }
 
+// --------- Handler ---------
 export default async function handler(req, res) {
   // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -161,36 +210,52 @@ export default async function handler(req, res) {
   }
 
   let original;
-  try {
-    original = new URL(url);
-  } catch {
-    return res.status(400).json({ success: false, error: "invalid url" });
-  }
+  try { original = new URL(url); }
+  catch { return res.status(400).json({ success: false, error: "invalid url" }); }
 
-  // Sempre voltamos o link ORIGINAL no template
-  const affiliate_url = url;
+  const affiliate_url = url; // sempre retorna o link original
 
   try {
-    const refererHost = isShopeeHost(original.hostname) ? "shopee.com.br" : null;
+    const { finalUrl, html } = await resolveFinal(original.toString());
+    const finalHost = (() => { try { return new URL(finalUrl).hostname; } catch { return original.hostname; } })();
+    const isShopee = isShopeeHost(finalHost);
 
-    // Resolve a URL final e pega o HTML de lá
-    const { finalUrl, html } = await resolveFinal(original.toString(), refererHost);
-    const finalHost = (() => {
-      try { return new URL(finalUrl).hostname; } catch { return original.hostname; }
-    })();
+    let title = null;
+    let price = null;
 
-    // Título: JSON-LD → <title>/og:title → slug → fallback
-    const fromLD = tryParseJSONLD(html);
-    let title =
-      sanitizeTitle(fromLD.title) ||
-      sanitizeTitle(parseTitleFromHTML(html)) ||
-      titleFromSlug(finalUrl) ||
-      (isShopeeHost(finalHost) ? "Produto Shopee" : "Página");
+    if (isShopee) {
+      // 1) IDs pela URL final
+      let ids = parseShopeeIdsFromUrl(finalUrl);
 
-    // Preço (opcional): só se vier no JSON-LD (não vamos “chutar”)
-    const price = typeof fromLD.price === "number" ? fromLD.price : null;
+      // 2) se não houver, IDs pelo HTML
+      if (!ids) ids = extractShopeeIdsFromHtml(html || "");
 
-    const { template_line, template_caption } = buildTemplates(title, price, affiliate_url, isShopeeHost(finalHost));
+      // 3) se ainda não, IDs por canonical/og:url do HTML
+      if (!ids) {
+        const hinted = parseCanonicalOrOgUrl(html || "", finalUrl);
+        if (hinted) ids = parseShopeeIdsFromUrl(hinted);
+      }
+
+      // 4) tenta API (com swap em caso ambíguo)
+      if (ids) {
+        const viaApi = await resolveShopeeTitlePrice(ids, finalUrl);
+        title = viaApi.title || null;
+        price = viaApi.price;
+      }
+
+      // 5) Fallbacks de título se a API não deu
+      if (!title) {
+        title = sanitizeTitle(parseTitleFromHTML(html || "")) || titleFromSlug(finalUrl);
+      }
+    } else {
+      // Não Shopee
+      title = sanitizeTitle(parseTitleFromHTML(html || "")) || titleFromSlug(finalUrl) || "Página";
+      price = null;
+    }
+
+    if (!title) title = isShopee ? "Produto Shopee" : "Página";
+
+    const { template_line, template_caption } = buildTemplates(title, price, affiliate_url, isShopee);
 
     return res.status(200).json({
       success: true,
@@ -200,11 +265,10 @@ export default async function handler(req, res) {
       currency: "BRL",
       image: null,
       availability: null,
-      // MUITO IMPORTANTE: mantemos o link ORIGINAL que você enviou
-      affiliate_url,
+      affiliate_url,          // mantém seu shortlink
       template_line,
       template_caption,
-      debug_url_final: finalUrl // opcional: ajuda a entender de onde veio o título
+      debug_url_final: finalUrl
     });
   } catch (err) {
     return res.status(500).json({ success: false, error: String(err) });
