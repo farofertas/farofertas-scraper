@@ -1,11 +1,11 @@
-// api/scraper.js — fetch-only, limpo e direto.
-// Estratégia:
-// - Segue o shortlink com redirect: 'follow' e captura a URL final + HTML.
-// - Se cair em Shopee: extrai shopid/itemid (inclui /opaanlp/{shopid}/{itemid}),
-//   monta a canônica https://shopee.com.br/i.{shopid}.{itemid} e busca o <title>/og:title.
-// - Evita títulos inválidos: numéricos puros ou no padrão "i.shopid.itemid".
-// - Fallback: slug da URL; por fim "Produto Shopee" / "Página".
-// - SEMPRE preserva a URL original no affiliate_url e no template.
+// api/scraper.js — fetch-only, com resolução de shortlink e múltiplas tentativas de API da Shopee.
+// Fluxo:
+// 1) Segue o shortlink (redirect: 'follow'), pega finalUrl + HTML.
+// 2) Se for Shopee: extrai shopid/itemid (inclui /opaanlp/{shopid}/{itemid}).
+// 3) Tenta nome/preço via API pública (v4 item/get com headers desktop e mobile; v2 item/get).
+// 4) Se APIs falharem, tenta título da página canônica https://shopee.com.br/i.{shopid}.{itemid} (desktop→mobile).
+// 5) Se ainda falhar, tenta <title>/og:title da final ou slug; último fallback: "Produto Shopee".
+// 6) O template SEMPRE usa o link original enviado (shortlink do afiliado).
 
 const UA_DESKTOP = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127 Safari/537.36";
 const UA_MOBILE  = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1";
@@ -21,6 +21,16 @@ const HTML_HEADERS_MOBILE = {
   "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
   "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
   "Upgrade-Insecure-Requests": "1"
+};
+const JSON_HEADERS_DESKTOP = {
+  "User-Agent": UA_DESKTOP,
+  "Accept": "application/json, text/plain, */*",
+  "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8"
+};
+const JSON_HEADERS_MOBILE = {
+  "User-Agent": UA_MOBILE,
+  "Accept": "application/json, text/plain, */*",
+  "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8"
 };
 
 const isShopeeHost = (h) =>
@@ -57,7 +67,7 @@ function buildTemplates(title, price, affiliateUrl, isShopee) {
   return { template_line: line, template_caption: caption };
 }
 
-// --- helpers de redirect e canônico ---
+// --- helpers de redirect ---
 async function resolveFinal(urlStr) {
   try {
     const r = await fetch(urlStr, { method: "GET", redirect: "follow", headers: HTML_HEADERS_DESKTOP });
@@ -69,7 +79,7 @@ async function resolveFinal(urlStr) {
   }
 }
 
-// Shopee IDs: ...-i.shopid.itemid | /product/shopid/itemid | /opaanlp/shopid/itemid | genérico: 2 segmentos numéricos seguidos
+// --- IDs Shopee: suporta ...-i.shopid.itemid | /product/shopid/itemid | /opaanlp/shopid/itemid | genérico: 2 números seguidos ---
 function parseShopeeIdsFromUrl(urlStr) {
   try {
     const p = new URL(urlStr).pathname;
@@ -95,40 +105,77 @@ function parseShopeeIdsFromUrl(urlStr) {
 function titleFromSlug(urlStr) {
   try {
     const u = new URL(urlStr);
-    // /<slug>-i.shopid.itemid
     let m = u.pathname.match(/\/([^\/]+)-i\.\d+\.\d+(?:$|\?)/i);
     if (m?.[1]) return decodeURIComponent(m[1]).replace(/[-_]+/g, " ").trim();
-    // /<slug>/product/shopid/itemid
     m = u.pathname.match(/\/([^\/]+)\/product\/\d+\/\d+(?:$|\?)/i);
     if (m?.[1]) return decodeURIComponent(m[1]).replace(/[-_]+/g, " ").trim();
-    // último segmento
     const segs = u.pathname.split("/").filter(Boolean);
     if (segs.length) return decodeURIComponent(segs[segs.length - 1]).replace(/[-_]+/g, " ").trim();
     return null;
   } catch { return null; }
 }
 
+// --- Tentativas de API pública da Shopee ---
+async function tryShopeeAPIv4(shopid, itemid, referer, useMobileUA = false) {
+  const headers = useMobileUA ? JSON_HEADERS_MOBILE : JSON_HEADERS_DESKTOP;
+  const url = `https://shopee.com.br/api/v4/item/get?itemid=${itemid}&shopid=${shopid}`;
+  const r = await fetch(url, { headers: { ...headers, Referer: referer } });
+  if (!r.ok) throw new Error(`v4 ${r.status}`);
+  const j = await r.json();
+  const d = j?.data;
+  if (!d) throw new Error("v4 sem data");
+  const price = typeof d.price === "number" ? d.price / 100000 : null;
+  const title = d.name || null;
+  return { title, price };
+}
+
+async function tryShopeeAPIv2(shopid, itemid, referer, useMobileUA = false) {
+  const headers = useMobileUA ? JSON_HEADERS_MOBILE : JSON_HEADERS_DESKTOP;
+  const url = `https://shopee.com.br/api/v2/item/get?itemid=${itemid}&shopid=${shopid}`;
+  const r = await fetch(url, { headers: { ...headers, Referer: referer } });
+  if (!r.ok) throw new Error(`v2 ${r.status}`);
+  const j = await r.json();
+  const d = j?.item;
+  if (!d) throw new Error("v2 sem item");
+  const price = typeof d.price === "number" ? d.price / 100000 : null;
+  const title = d.name || null;
+  return { title, price };
+}
+
 async function fetchTitleFromCanonical(shopid, itemid) {
   const canonical = `https://shopee.com.br/i.${shopid}.${itemid}`;
-
-  // Tenta desktop
+  // desktop
   try {
     const r = await fetch(canonical, { headers: HTML_HEADERS_DESKTOP });
     const html = await r.text();
     const t = sanitizeTitle(parseTitleFromHTML(html));
     if (t) return { title: t, canonical };
   } catch {}
-
-  // Tenta mobile
+  // mobile
   try {
     const r2 = await fetch(canonical, { headers: HTML_HEADERS_MOBILE });
     const html2 = await r2.text();
     const t2 = sanitizeTitle(parseTitleFromHTML(html2));
     if (t2) return { title: t2, canonical };
   } catch {}
-
-  // Fallback: slug da canônica
+  // slug
   return { title: sanitizeTitle(titleFromSlug(canonical)) || null, canonical };
+}
+
+async function resolveShopeeNamePrice(shopid, itemid, finalUrl) {
+  const referer = `https://shopee.com.br/i.${shopid}.${itemid}`;
+  // v4 desktop
+  try { return await tryShopeeAPIv4(shopid, itemid, referer, false); } catch {}
+  // v4 mobile
+  try { return await tryShopeeAPIv4(shopid, itemid, referer, true); } catch {}
+  // v2 desktop
+  try { return await tryShopeeAPIv2(shopid, itemid, referer, false); } catch {}
+  // v2 mobile
+  try { return await tryShopeeAPIv2(shopid, itemid, referer, true); } catch {}
+  // Título da canônica
+  try { return await fetchTitleFromCanonical(shopid, itemid); } catch {}
+  // Fallback vazio
+  return { title: null, price: null };
 }
 
 // --- handler ---
@@ -145,7 +192,7 @@ export default async function handler(req, res) {
   let original;
   try { original = new URL(url); } catch { return res.status(400).json({ success: false, error: "invalid url" }); }
 
-  const affiliate_url = url; // sempre o link original no template
+  const affiliate_url = url; // SEMPRE usa o link original no template
 
   try {
     const { finalUrl, html } = await resolveFinal(original.toString());
@@ -157,27 +204,25 @@ export default async function handler(req, res) {
 
     if (isShopee) {
       const ids = parseShopeeIdsFromUrl(finalUrl);
-
       if (ids) {
-        // Título da página canônica i.{shopid}.{itemid}
-        const { title: tCan } = await fetchTitleFromCanonical(ids.shopid, ids.itemid);
-        title =
-          sanitizeTitle(tCan) ||
-          sanitizeTitle(parseTitleFromHTML(html)) ||
-          sanitizeTitle(titleFromSlug(finalUrl));
+        // tenta APIs e, se preciso, título da canônica
+        const got = await resolveShopeeNamePrice(ids.shopid, ids.itemid, finalUrl);
+        title = sanitizeTitle(got.title) ||
+                sanitizeTitle(parseTitleFromHTML(html)) ||
+                sanitizeTitle(titleFromSlug(finalUrl)) ||
+                null;
+        price = typeof got.price === "number" ? got.price : null;
       } else {
-        // sem IDs — tenta título direto da final ou slug
-        title =
-          sanitizeTitle(parseTitleFromHTML(html)) ||
-          sanitizeTitle(titleFromSlug(finalUrl));
+        // sem IDs — tenta HTML/slug direto
+        title = sanitizeTitle(parseTitleFromHTML(html)) ||
+                sanitizeTitle(titleFromSlug(finalUrl)) ||
+                null;
       }
-
       if (!title) title = "Produto Shopee";
     } else {
-      title =
-        sanitizeTitle(parseTitleFromHTML(html)) ||
-        sanitizeTitle(titleFromSlug(finalUrl)) ||
-        "Página";
+      title = sanitizeTitle(parseTitleFromHTML(html)) ||
+              sanitizeTitle(titleFromSlug(finalUrl)) ||
+              "Página";
     }
 
     const { template_line, template_caption } = buildTemplates(title, price, affiliate_url, isShopee);
@@ -190,14 +235,13 @@ export default async function handler(req, res) {
       currency: "BRL",
       image: null,
       availability: null,
-      affiliate_url,              // teu shortlink original
+      affiliate_url,              // preserva teu shortlink
       template_line,
       template_caption,
-      debug_url_final: finalUrl   // útil pra diagnosticar
+      debug_url_final: finalUrl   // útil pra diagnóstico
     });
   } catch (err) {
     return res.status(500).json({ success: false, error: String(err) });
   }
 }
-
 
