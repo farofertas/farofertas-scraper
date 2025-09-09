@@ -1,18 +1,18 @@
-// api/scraper.js — fetch-only, Shopee shortlink robusto + título por slug.
-// Mantém o link original (shortlink) em affiliate_url e entrega templates prontos.
+// api/scraper.js — fetch-only, robusto p/ Shopee shortlink, com título garantido e preservando seu link afiliado.
+// Node 20+ (fetch global). Retorna também template_line e template_caption prontos.
 
 const UA_DESKTOP =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36";
 const UA_MOBILE =
   "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1";
 
-const baseHTMLHeaders = (ua) => ({
+const htmlHeaders = (ua) => ({
   "User-Agent": ua,
   "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
   "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
   "Upgrade-Insecure-Requests": "1"
 });
-const baseJSONHeaders = (ua) => ({
+const jsonHeaders = (ua) => ({
   "User-Agent": ua,
   "Accept": "application/json, text/plain, */*",
   "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8"
@@ -27,7 +27,7 @@ const sanitizeNumber = (txt) => {
   return Number.isFinite(n) ? n : null;
 };
 const extractBetween = (html, re) => (html.match(re)?.[1]?.trim() ?? null);
-const parseTitle = (html) =>
+const parseTitleMeta = (html) =>
   extractBetween(html, /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["'][^>]*>/i) ||
   extractBetween(html, /<title[^>]*>([^<]+)<\/title>/i) || null;
 const parseOgImage = (html) =>
@@ -93,13 +93,19 @@ function buildTemplates({ title, price, currency, affiliateUrl }) {
     : `🔥 ${safeTitle}\n${affiliateUrl}`;
   return { template_line, template_caption };
 }
+function sanitizeTitle(t) {
+  if (!t) return null;
+  const clean = String(t).trim();
+  if (/^\d{6,}$/.test(clean)) return null; // evita só números (ex.: itemid)
+  return clean;
+}
 
 // ---------- Shopee ----------
 const SHOPEE_ITEM_API = "https://shopee.com.br/api/v4/item/get";
 const isShopeeShortHost = (h) => /(^|\.)s\.shopee\.com\.br$/i.test(h) || /(^|\.)shope\.ee$/i.test(h);
 const isShopeeHost = (h) => /(^|\.)shopee\./i.test(h);
 
-// IDs por URL (dois formatos: ...-i.shopid.itemid e /product/shopid/itemid)
+// IDs por URL: ...-i.shopid.itemid ou /product/shopid/itemid
 function parseShopeeIdsFromUrl(urlStr) {
   try {
     const u = new URL(urlStr);
@@ -110,12 +116,10 @@ function parseShopeeIdsFromUrl(urlStr) {
     return null;
   } catch { return null; }
 }
-
-// IDs escondidos no HTML
+// IDs escondidos no HTML (vários formatos, inclusive *_str)
 function extractShopeeIdsFromHtml(html) {
   let m = html.match(/(?:^|[^\w])i\.(\d+)\.(\d+)(?:[^\d]|$)/i);
   if (m) return { shopid: m[1], itemid: m[2] };
-  // JSON inline variados
   const pairs = [
     [/["']shopid["']\s*:\s*(\d+)/i, /["']itemid["']\s*:\s*(\d+)/i],
     [/shopid\s*:\s*(\d+)/i, /itemid\s*:\s*(\d+)/i],
@@ -125,20 +129,29 @@ function extractShopeeIdsFromHtml(html) {
     const s = html.match(reS), i = html.match(reI);
     if (s && i) return { shopid: s[1], itemid: i[1] };
   }
+  const shopStr = html.match(/"shopid_str"\s*:\s*"(\d+)"/i)?.[1];
+  const itemStr = html.match(/"itemid_str"\s*:\s*"(\d+)"/i)?.[1];
+  if (shopStr && itemStr) return { shopid: shopStr, itemid: itemStr };
   return null;
 }
-
-// Título básico pelo slug (antes de -i.shopid.itemid; também serve para /product/…)
+// Pega IDs também de canonical/og:url
+function parseIdsFromCanonicalOg(html) {
+  const canon = html.match(/<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["']/i)?.[1];
+  const og = html.match(/<meta[^>]+property=["']og:url["'][^>]+content=["']([^"']+)["']/i)?.[1];
+  for (const u of [canon, og].filter(Boolean)) {
+    const ids = parseShopeeIdsFromUrl(u);
+    if (ids) return ids;
+  }
+  return null;
+}
+// Título básico pelo slug (antes de -i.shopid.itemid; ou segmento legível)
 function titleFromSlug(urlStr) {
   try {
     const u = new URL(urlStr);
-    // tenta slug do formato .../<slug>-i.shopid.itemid
     const m1 = u.pathname.match(/\/([^\/]+)-i\.\d+\.\d+(?:$|\?)/i);
     if (m1 && m1[1]) return decodeURIComponent(m1[1]).replace(/[-_]+/g, " ").trim();
-    // tenta /product/{shopid}/{itemid} com slug anterior
     const m2 = u.pathname.match(/\/([^\/]+)\/product\/\d+\/\d+/i);
     if (m2 && m2[1]) return decodeURIComponent(m2[1]).replace(/[-_]+/g, " ").trim();
-    // fallback: último segmento legível
     const segs = u.pathname.split("/").filter(Boolean);
     if (segs.length) return decodeURIComponent(segs[segs.length - 1]).replace(/[-_]+/g, " ").trim();
     return null;
@@ -150,12 +163,11 @@ async function tryFollowRedirect(urlStr, ua) {
   const r = await fetch(urlStr, {
     method: "GET",
     redirect: "follow",
-    headers: { ...baseHTMLHeaders(ua), Referer: "https://shopee.com.br/" }
+    headers: { ...htmlHeaders(ua), Referer: "https://shopee.com.br/" }
   });
   return { finalUrl: r.url || urlStr, status: r.status, html: await r.text().catch(() => "") };
 }
-
-// 2) loop manual
+// 2) loop manual (Location + meta refresh + canonical + og:url)
 async function resolveRedirectsManual(urlStr, ua, maxHops = 10) {
   let current = urlStr;
   for (let i = 0; i < maxHops; i++) {
@@ -164,7 +176,7 @@ async function resolveRedirectsManual(urlStr, ua, maxHops = 10) {
     const r = await fetch(current, {
       method: "GET",
       redirect: "manual",
-      headers: { ...baseHTMLHeaders(ua), Referer: isShort ? "https://shopee.com.br/" : u.origin + "/" }
+      headers: { ...htmlHeaders(ua), Referer: isShort ? "https://shopee.com.br/" : u.origin + "/" }
     });
     const status = r.status;
     const loc = r.headers.get("location");
@@ -183,8 +195,7 @@ async function resolveRedirectsManual(urlStr, ua, maxHops = 10) {
   }
   return current;
 }
-
-// resolvedor combinado
+// resolvedor combinado p/ shortlink
 async function resolveShortShopee(urlStr) {
   try {
     const r1 = await tryFollowRedirect(urlStr, UA_DESKTOP);
@@ -199,8 +210,8 @@ async function resolveShortShopee(urlStr) {
 }
 
 async function fetchShopeeItem(shopid, itemid, originalUrl) {
-  const r = await fetch(`https://shopee.com.br/api/v4/item/get?itemid=${itemid}&shopid=${shopid}`, {
-    headers: { ...baseJSONHeaders(UA_DESKTOP), Referer: originalUrl }
+  const r = await fetch(`${SHOPEE_ITEM_API}?itemid=${itemid}&shopid=${shopid}`, {
+    headers: { ...jsonHeaders(UA_DESKTOP), Referer: originalUrl }
   });
   if (!r.ok) throw new Error(`Shopee API status ${r.status}`);
   const j = await r.json();
@@ -242,31 +253,33 @@ export default async function handler(req, res) {
       parsed = new URL(finalStr);
     }
 
-    // 2) Shopee: tenta IDs via URL OU HTML; se tiver, usa API JSON (dados) e devolve o link original
+    // 2) Shopee: tenta IDs via URL/HTML; se tiver, usa API JSON (dados) e devolve o link original
     const host = parsed.hostname;
     if (isShopeeHost(host)) {
       // (a) IDs na URL
       let ids = parseShopeeIdsFromUrl(parsed.toString());
 
-      // (b) se faltou, baixa HTML (UA desktop → mobile) e tenta achar IDs
+      // (b) se faltou, baixa HTML (desktop→mobile) e tenta achar IDs
       let htmlForIds = null;
       if (!ids) {
-        const r1 = await fetch(parsed.toString(), { headers: { ...baseHTMLHeaders(UA_DESKTOP), Referer: "https://shopee.com.br/" } });
+        const r1 = await fetch(parsed.toString(), { headers: { ...htmlHeaders(UA_DESKTOP), Referer: "https://shopee.com.br/" } });
         htmlForIds = await r1.text().catch(() => "");
-        ids = extractShopeeIdsFromHtml(htmlForIds || "");
+        ids = extractShopeeIdsFromHtml(htmlForIds || "") || parseIdsFromCanonicalOg(htmlForIds || "");
         if (!ids) {
-          const r2 = await fetch(parsed.toString(), { headers: { ...baseHTMLHeaders(UA_MOBILE), Referer: "https://shopee.com.br/" } });
+          const r2 = await fetch(parsed.toString(), { headers: { ...htmlHeaders(UA_MOBILE), Referer: "https://shopee.com.br/" } });
           const htmlM = await r2.text().catch(() => "");
-          ids = extractShopeeIdsFromHtml(htmlM || "");
+          ids = extractShopeeIdsFromHtml(htmlM || "") || parseIdsFromCanonicalOg(htmlM || "");
         }
       }
 
       if (ids) {
         try {
           const data = await fetchShopeeItem(ids.shopid, ids.itemid, parsed.toString());
-          const titleFromApi = data.title || null;
-          const titleFromUrl = titleFromSlug(parsed.toString());
-          const safeTitle = titleFromApi || titleFromUrl || "Produto Shopee";
+          const candApi = sanitizeTitle(data.title);
+          const candSlug = sanitizeTitle(titleFromSlug(parsed.toString()));
+          const candHtml = sanitizeTitle(parseTitleMeta(htmlForIds || ""));
+          const safeTitle = candApi || candHtml || candSlug || "Produto Shopee";
+
           const { template_line, template_caption } = buildTemplates({
             title: safeTitle, price: data.price ?? null, currency: data.currency || "BRL",
             affiliateUrl: originalAffiliateUrl
@@ -281,30 +294,30 @@ export default async function handler(req, res) {
             availability: data.availability || null,
             affiliate_url: originalAffiliateUrl, // mantém teu shortlink
             template_line, template_caption,
-            note: "Shopee JSON API (IDs via URL/HTML; título via API/slug; shortlink preservado)"
+            note: "Shopee JSON API (IDs via URL/HTML; título via API/HTML/slug; shortlink preservado)"
           });
           return;
         } catch {
-          // segue pro fallback de título
+          // segue para fallback de título
         }
       }
 
       // (c) Fallback de título: usa HTML (desktop->mobile) OU slug da URL
       let html = "";
       try {
-        const r1 = await fetch(parsed.toString(), { headers: { ...baseHTMLHeaders(UA_DESKTOP), Referer: "https://shopee.com.br/" } });
+        const r1 = await fetch(parsed.toString(), { headers: { ...htmlHeaders(UA_DESKTOP), Referer: "https://shopee.com.br/" } });
         html = await r1.text();
       } catch {}
       if (!html || html.length < 1000) {
         try {
-          const r2 = await fetch(parsed.toString(), { headers: { ...baseHTMLHeaders(UA_MOBILE), Referer: "https://shopee.com.br/" } });
+          const r2 = await fetch(parsed.toString(), { headers: { ...htmlHeaders(UA_MOBILE), Referer: "https://shopee.com.br/" } });
           const htmlM = await r2.text();
           if (htmlM && htmlM.length > html.length) html = htmlM;
         } catch {}
       }
-      const titleHTML = parseTitle(html);
-      const titleSlug = titleFromSlug(parsed.toString());
-      const titleFallback = titleHTML || titleSlug || "Produto Shopee";
+      const candHtml = sanitizeTitle(parseTitleMeta(html || ""));
+      const candSlug = sanitizeTitle(titleFromSlug(parsed.toString()));
+      const titleFallback = candHtml || candSlug || "Produto Shopee";
 
       const { template_line, template_caption } = buildTemplates({
         title: titleFallback, price: null, currency: "BRL", affiliateUrl: originalAffiliateUrl
@@ -325,10 +338,10 @@ export default async function handler(req, res) {
     }
 
     // 3) Fluxo genérico (outros domínios)
-    let r = await fetch(parsed.toString(), { headers: baseHTMLHeaders(UA_DESKTOP) });
+    let r = await fetch(parsed.toString(), { headers: htmlHeaders(UA_DESKTOP) });
     if (r.status === 404 && !/^www\./i.test(parsed.hostname)) {
       const alt = new URL(parsed); alt.hostname = `www.${parsed.hostname}`;
-      r = await fetch(alt.toString(), { headers: baseHTMLHeaders(UA_DESKTOP) });
+      r = await fetch(alt.toString(), { headers: htmlHeaders(UA_DESKTOP) });
       parsed = alt;
     }
     const status = r.status;
@@ -336,7 +349,10 @@ export default async function handler(req, res) {
     if (status >= 400) { res.status(502).json({ success: false, error: `Destino respondeu ${status}` }); return; }
 
     const ld = parseJSONLD(html);
-    const title = ld.title || parseTitle(html) || "Página";
+    const candLd = sanitizeTitle(ld.title);
+    const candHtml = sanitizeTitle(parseTitleMeta(html));
+    const title = candLd || candHtml || "Página";
+
     let price = ld.price ?? parseMetaPrice(html) ?? null;
     let currency = (ld.currency || parseMetaCurrency(html) || "BRL").toUpperCase();
     const image = ld.image || parseOgImage(html) || null;
@@ -370,6 +386,8 @@ export default async function handler(req, res) {
   } catch (err) {
     res.status(502).json({ success: false, error: err?.message || "fetch failed" });
   }
+}
+
 }
 
 
