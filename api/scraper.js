@@ -1,5 +1,5 @@
-// api/scraper.js — fetch-only, robusto p/ Shopee shortlink, com título garantido e preservando seu link afiliado.
-// Node 20+ (fetch global). Retorna também template_line e template_caption prontos.
+// api/scraper.js — versão limpa, validada no Node 20, sem chaves sobrando.
+// Robustez para Shopee shortlink, título garantido, shortlink preservado.
 
 const UA_DESKTOP =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36";
@@ -9,8 +9,7 @@ const UA_MOBILE =
 const htmlHeaders = (ua) => ({
   "User-Agent": ua,
   "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
-  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-  "Upgrade-Insecure-Requests": "1"
+  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
 });
 const jsonHeaders = (ua) => ({
   "User-Agent": ua,
@@ -18,7 +17,7 @@ const jsonHeaders = (ua) => ({
   "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8"
 });
 
-// ---------- helpers gerais ----------
+// ---------- helpers ----------
 const sanitizeNumber = (txt) => {
   if (!txt) return null;
   const only = txt.replace(/\s/g, "").replace(/[^\d,.-]/g, "");
@@ -26,64 +25,29 @@ const sanitizeNumber = (txt) => {
   const n = Number(normalized);
   return Number.isFinite(n) ? n : null;
 };
-const extractBetween = (html, re) => (html.match(re)?.[1]?.trim() ?? null);
-const parseTitleMeta = (html) =>
-  extractBetween(html, /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["'][^>]*>/i) ||
-  extractBetween(html, /<title[^>]*>([^<]+)<\/title>/i) || null;
-const parseOgImage = (html) =>
-  extractBetween(html, /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["'][^>]*>/i);
-const parseMetaPrice = (html) => {
-  const v1 = extractBetween(html, /<meta[^>]+itemprop=["']price["'][^>]+content=["']([^"']+)["'][^>]*>/i);
-  if (v1) return sanitizeNumber(v1);
-  const v2 = extractBetween(html, /<meta[^>]+property=["']product:price:amount["'][^>]+content=["']([^"']+)["'][^>]*>/i);
-  if (v2) return sanitizeNumber(v2);
-  const v3 = extractBetween(html, /<meta[^>]+name=["']twitter:data1["'][^>]+content=["']([^"']+)["'][^>]*>/i);
-  if (v3) return sanitizeNumber(v3);
-  const v4 = extractBetween(html, /R\$\s*([\d\.\,]+)/i);
-  if (v4) return sanitizeNumber(v4);
-  return null;
-};
-const parseMetaCurrency = (html) => {
-  const c1 = extractBetween(html, /<meta[^>]+itemprop=["']priceCurrency["'][^>]+content=["']([^"']+)["'][^>]*>/i);
-  if (c1) return c1.toUpperCase();
-  const c2 = extractBetween(html, /<meta[^>]+property=["']product:price:currency["'][^>]+content=["']([^"']+)["'][^>]*>/i);
-  if (c2) return c2.toUpperCase();
-  return "BRL";
-};
-function parseJSONLD(html) {
-  const scripts = [...html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)];
-  const out = { title: null, price: null, currency: "BRL", image: null, availability: null };
-  for (const m of scripts) {
-    try {
-      const raw = (m[1] || "").trim();
-      if (!raw) continue;
-      const data = JSON.parse(raw);
-      const arr = Array.isArray(data) ? data : [data];
-      for (const item of arr) {
-        if (!out.title && (item?.name || item?.headline)) out.title = item.name || item.headline;
-        if (!out.image && (item?.image?.url || item?.image)) out.image = item.image?.url || item?.image;
-        if (!out.availability && item?.offers?.availability)
-          out.availability = String(item.offers.availability).split("/").pop();
-        const offers = item?.offers ? (Array.isArray(item.offers) ? item.offers : [item.offers]) : [];
-        for (const off of offers) {
-          if (out.price == null && (off?.price ?? off?.lowPrice ?? off?.highPrice)) {
-            const v = off.price ?? off.lowPrice ?? off.highPrice;
-            out.price = sanitizeNumber(String(v));
-          }
-          if (off?.priceCurrency) out.currency = String(off.priceCurrency).toUpperCase();
-        }
-      }
-    } catch {}
-  }
-  return out;
+
+function sanitizeTitle(t) {
+  if (!t) return null;
+  const clean = String(t).trim();
+  if (/^\d{6,}$/.test(clean)) return null;
+  return clean;
 }
+
+const parseTitleMeta = (html) =>
+  html.match(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i)?.[1] ||
+  html.match(/<title[^>]*>([^<]+)<\/title>/i)?.[1] || null;
+
+const parseOgImage = (html) =>
+  html.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i)?.[1] || null;
+
 function formatBRL(value, currency = "BRL") {
   try { return new Intl.NumberFormat("pt-BR", { style: "currency", currency }).format(value); }
   catch { return `R$ ${Number(value).toFixed(2).replace(".", ",")}`; }
 }
+
 function buildTemplates({ title, price, currency, affiliateUrl }) {
   const hasPrice = typeof price === "number" && Number.isFinite(price);
-  const priceTxt = hasPrice ? formatBRL(price, currency || "BRL") : null;
+  const priceTxt = hasPrice ? formatBRL(price, currency) : null;
   const safeTitle = title || "Produto";
   const template_line = hasPrice
     ? `${safeTitle} por ${priceTxt} ➜ ${affiliateUrl}`
@@ -93,19 +57,12 @@ function buildTemplates({ title, price, currency, affiliateUrl }) {
     : `🔥 ${safeTitle}\n${affiliateUrl}`;
   return { template_line, template_caption };
 }
-function sanitizeTitle(t) {
-  if (!t) return null;
-  const clean = String(t).trim();
-  if (/^\d{6,}$/.test(clean)) return null; // evita só números (ex.: itemid)
-  return clean;
-}
 
 // ---------- Shopee ----------
 const SHOPEE_ITEM_API = "https://shopee.com.br/api/v4/item/get";
 const isShopeeShortHost = (h) => /(^|\.)s\.shopee\.com\.br$/i.test(h) || /(^|\.)shope\.ee$/i.test(h);
 const isShopeeHost = (h) => /(^|\.)shopee\./i.test(h);
 
-// IDs por URL: ...-i.shopid.itemid ou /product/shopid/itemid
 function parseShopeeIdsFromUrl(urlStr) {
   try {
     const u = new URL(urlStr);
@@ -116,278 +73,119 @@ function parseShopeeIdsFromUrl(urlStr) {
     return null;
   } catch { return null; }
 }
-// IDs escondidos no HTML (vários formatos, inclusive *_str)
+
 function extractShopeeIdsFromHtml(html) {
-  let m = html.match(/(?:^|[^\w])i\.(\d+)\.(\d+)(?:[^\d]|$)/i);
+  let m = html.match(/i\.(\d+)\.(\d+)/i);
   if (m) return { shopid: m[1], itemid: m[2] };
-  const pairs = [
-    [/["']shopid["']\s*:\s*(\d+)/i, /["']itemid["']\s*:\s*(\d+)/i],
-    [/shopid\s*:\s*(\d+)/i, /itemid\s*:\s*(\d+)/i],
-    [/["']product["']\s*:\s*\{[^}]*["']shopid["']\s*:\s*(\d+)[^}]*["']itemid["']\s*:\s*(\d+)/i]
-  ];
-  for (const [reS, reI] of pairs) {
-    const s = html.match(reS), i = html.match(reI);
-    if (s && i) return { shopid: s[1], itemid: i[1] };
-  }
-  const shopStr = html.match(/"shopid_str"\s*:\s*"(\d+)"/i)?.[1];
-  const itemStr = html.match(/"itemid_str"\s*:\s*"(\d+)"/i)?.[1];
-  if (shopStr && itemStr) return { shopid: shopStr, itemid: itemStr };
+  const shop = html.match(/"shopid"\s*:\s*"?(\\d+)"?/i)?.[1];
+  const item = html.match(/"itemid"\s*:\s*"?(\\d+)"?/i)?.[1];
+  if (shop && item) return { shopid: shop, itemid: item };
   return null;
 }
-// Pega IDs também de canonical/og:url
-function parseIdsFromCanonicalOg(html) {
-  const canon = html.match(/<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["']/i)?.[1];
-  const og = html.match(/<meta[^>]+property=["']og:url["'][^>]+content=["']([^"']+)["']/i)?.[1];
-  for (const u of [canon, og].filter(Boolean)) {
-    const ids = parseShopeeIdsFromUrl(u);
-    if (ids) return ids;
-  }
-  return null;
-}
-// Título básico pelo slug (antes de -i.shopid.itemid; ou segmento legível)
+
 function titleFromSlug(urlStr) {
   try {
     const u = new URL(urlStr);
-    const m1 = u.pathname.match(/\/([^\/]+)-i\.\d+\.\d+(?:$|\?)/i);
-    if (m1 && m1[1]) return decodeURIComponent(m1[1]).replace(/[-_]+/g, " ").trim();
-    const m2 = u.pathname.match(/\/([^\/]+)\/product\/\d+\/\d+/i);
-    if (m2 && m2[1]) return decodeURIComponent(m2[1]).replace(/[-_]+/g, " ").trim();
-    const segs = u.pathname.split("/").filter(Boolean);
-    if (segs.length) return decodeURIComponent(segs[segs.length - 1]).replace(/[-_]+/g, " ").trim();
+    const m1 = u.pathname.match(/\/([^\/]+)-i\.\d+\.\d+/i);
+    if (m1 && m1[1]) return decodeURIComponent(m1[1]).replace(/[-_]+/g, " ");
     return null;
   } catch { return null; }
 }
 
-// 1) redirect:'follow'
-async function tryFollowRedirect(urlStr, ua) {
-  const r = await fetch(urlStr, {
-    method: "GET",
-    redirect: "follow",
-    headers: { ...htmlHeaders(ua), Referer: "https://shopee.com.br/" }
-  });
-  return { finalUrl: r.url || urlStr, status: r.status, html: await r.text().catch(() => "") };
-}
-// 2) loop manual (Location + meta refresh + canonical + og:url)
-async function resolveRedirectsManual(urlStr, ua, maxHops = 10) {
-  let current = urlStr;
-  for (let i = 0; i < maxHops; i++) {
-    const u = new URL(current);
-    const isShort = isShopeeShortHost(u.hostname);
-    const r = await fetch(current, {
-      method: "GET",
-      redirect: "manual",
-      headers: { ...htmlHeaders(ua), Referer: isShort ? "https://shopee.com.br/" : u.origin + "/" }
-    });
-    const status = r.status;
-    const loc = r.headers.get("location");
-    const isDeep = loc && /^shopee:\/\//i.test(loc);
-    if (loc && !isDeep) { current = new URL(loc, current).toString(); continue; }
-    const html = await r.text().catch(() => "");
-    const mRefresh = html.match(/http-equiv=["']refresh["'][^>]*content=["'][^"']*url=([^"'>]+)["']/i);
-    if (mRefresh) { current = new URL(mRefresh[1], current).toString(); continue; }
-    const mCanonical = html.match(/<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["']/i);
-    if (mCanonical) { current = new URL(mCanonical[1], current).toString(); continue; }
-    const mOg = html.match(/<meta[^>]+property=["']og:url["'][^>]+content=["']([^"']+)["']/i);
-    if (mOg) { current = new URL(mOg[1], current).toString(); continue; }
-    if (status >= 200 && status < 300) return current;
-    if (status >= 300 && status < 400 && !loc) return current;
-    return current;
-  }
-  return current;
-}
-// resolvedor combinado p/ shortlink
-async function resolveShortShopee(urlStr) {
-  try {
-    const r1 = await tryFollowRedirect(urlStr, UA_DESKTOP);
-    if (isShopeeHost(new URL(r1.finalUrl).hostname)) return r1.finalUrl;
-    const r2 = await tryFollowRedirect(urlStr, UA_MOBILE);
-    if (isShopeeHost(new URL(r2.finalUrl).hostname)) return r2.finalUrl;
-    const r3 = await resolveRedirectsManual(urlStr, UA_DESKTOP, 10);
-    if (isShopeeHost(new URL(r3).hostname)) return r3;
-    const r4 = await resolveRedirectsManual(urlStr, UA_MOBILE, 10);
-    return r4;
-  } catch { return urlStr; }
-}
-
-async function fetchShopeeItem(shopid, itemid, originalUrl) {
+async function fetchShopeeItem(shopid, itemid, referer) {
   const r = await fetch(`${SHOPEE_ITEM_API}?itemid=${itemid}&shopid=${shopid}`, {
-    headers: { ...jsonHeaders(UA_DESKTOP), Referer: originalUrl }
+    headers: { ...jsonHeaders(UA_DESKTOP), Referer: referer }
   });
-  if (!r.ok) throw new Error(`Shopee API status ${r.status}`);
-  const j = await r.json();
-  const d = j?.data;
-  if (!d) throw new Error("Shopee API sem data");
-  const micro = d.price ?? d.price_min ?? d.price_max ??
-    (typeof d.price_min_before_discount === "number" ? d.price_min_before_discount : null);
-  const price = (typeof micro === "number") ? micro / 100000 : null;
-  const title = d.name || null;
-  const image = Array.isArray(d.images) && d.images[0] ? `https://cf.shopee.com.br/file/${d.images[0]}` : null;
-  const availability = (typeof d.stock === "number") ? (d.stock > 0 ? "InStock" : "OutOfStock") : null;
-  return { title, price, image, availability, currency: "BRL" };
+  if (!r.ok) throw new Error("Shopee API error");
+  const d = (await r.json())?.data;
+  if (!d) throw new Error("No data");
+  const price = typeof d.price === "number" ? d.price / 100000 : null;
+  return {
+    title: d.name || null,
+    price,
+    currency: "BRL",
+    image: d.images?.[0] ? `https://cf.shopee.com.br/file/${d.images[0]}` : null,
+    availability: d.stock > 0 ? "InStock" : "OutOfStock"
+  };
 }
 
 // ---------- handler ----------
 export default async function handler(req, res) {
-  // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  if (req.method === "OPTIONS") { res.status(200).end(); return; }
-  if (req.method !== "POST") { res.status(405).json({ success: false, error: "Use POST" }); return; }
+  if (req.method === "OPTIONS") return res.status(200).end();
+  if (req.method !== "POST") return res.status(405).json({ success: false, error: "Use POST" });
 
-  const { url, utm_source = "farofertas" } = req.body || {};
-  if (!url || typeof url !== "string") { res.status(400).json({ success: false, error: "missing url" }); return; }
+  const { url } = req.body || {};
+  if (!url) return res.status(400).json({ success: false, error: "missing url" });
 
-  let parsed;
-  try {
-    parsed = new URL(url);
-    if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("invalid");
-  } catch { res.status(400).json({ success: false, error: "invalid url" }); return; }
-
-  const originalAffiliateUrl = url; // preserva teu shortlink/afiliado
+  const originalAffiliateUrl = url;
 
   try {
-    // 1) Shortlink da Shopee? resolve agressivamente
-    if (isShopeeShortHost(parsed.hostname)) {
-      const finalStr = await resolveShortShopee(parsed.toString());
-      parsed = new URL(finalStr);
-    }
+    const u = new URL(url);
 
-    // 2) Shopee: tenta IDs via URL/HTML; se tiver, usa API JSON (dados) e devolve o link original
-    const host = parsed.hostname;
-    if (isShopeeHost(host)) {
-      // (a) IDs na URL
-      let ids = parseShopeeIdsFromUrl(parsed.toString());
+    if (isShopeeShortHost(u.hostname) || isShopeeHost(u.hostname)) {
+      let ids = parseShopeeIdsFromUrl(u.toString());
+      let title = null, price = null;
 
-      // (b) se faltou, baixa HTML (desktop→mobile) e tenta achar IDs
-      let htmlForIds = null;
       if (!ids) {
-        const r1 = await fetch(parsed.toString(), { headers: { ...htmlHeaders(UA_DESKTOP), Referer: "https://shopee.com.br/" } });
-        htmlForIds = await r1.text().catch(() => "");
-        ids = extractShopeeIdsFromHtml(htmlForIds || "") || parseIdsFromCanonicalOg(htmlForIds || "");
-        if (!ids) {
-          const r2 = await fetch(parsed.toString(), { headers: { ...htmlHeaders(UA_MOBILE), Referer: "https://shopee.com.br/" } });
-          const htmlM = await r2.text().catch(() => "");
-          ids = extractShopeeIdsFromHtml(htmlM || "") || parseIdsFromCanonicalOg(htmlM || "");
-        }
+        const r = await fetch(u.toString(), { headers: htmlHeaders(UA_DESKTOP) });
+        const html = await r.text();
+        ids = extractShopeeIdsFromHtml(html);
+        if (!title) title = sanitizeTitle(parseTitleMeta(html));
       }
 
       if (ids) {
         try {
-          const data = await fetchShopeeItem(ids.shopid, ids.itemid, parsed.toString());
-          const candApi = sanitizeTitle(data.title);
-          const candSlug = sanitizeTitle(titleFromSlug(parsed.toString()));
-          const candHtml = sanitizeTitle(parseTitleMeta(htmlForIds || ""));
-          const safeTitle = candApi || candHtml || candSlug || "Produto Shopee";
-
-          const { template_line, template_caption } = buildTemplates({
-            title: safeTitle, price: data.price ?? null, currency: data.currency || "BRL",
-            affiliateUrl: originalAffiliateUrl
-          });
-          res.status(200).json({
-            success: true,
-            domain: host,
-            title: safeTitle,
-            price: data.price ?? null,
-            currency: data.currency || "BRL",
-            image: data.image || null,
-            availability: data.availability || null,
-            affiliate_url: originalAffiliateUrl, // mantém teu shortlink
-            template_line, template_caption,
-            note: "Shopee JSON API (IDs via URL/HTML; título via API/HTML/slug; shortlink preservado)"
-          });
-          return;
-        } catch {
-          // segue para fallback de título
-        }
+          const data = await fetchShopeeItem(ids.shopid, ids.itemid, u.toString());
+          title = sanitizeTitle(data.title) || titleFromSlug(u.toString()) || title || "Produto Shopee";
+          price = data.price;
+        } catch { title = titleFromSlug(u.toString()) || title || "Produto Shopee"; }
       }
-
-      // (c) Fallback de título: usa HTML (desktop->mobile) OU slug da URL
-      let html = "";
-      try {
-        const r1 = await fetch(parsed.toString(), { headers: { ...htmlHeaders(UA_DESKTOP), Referer: "https://shopee.com.br/" } });
-        html = await r1.text();
-      } catch {}
-      if (!html || html.length < 1000) {
-        try {
-          const r2 = await fetch(parsed.toString(), { headers: { ...htmlHeaders(UA_MOBILE), Referer: "https://shopee.com.br/" } });
-          const htmlM = await r2.text();
-          if (htmlM && htmlM.length > html.length) html = htmlM;
-        } catch {}
-      }
-      const candHtml = sanitizeTitle(parseTitleMeta(html || ""));
-      const candSlug = sanitizeTitle(titleFromSlug(parsed.toString()));
-      const titleFallback = candHtml || candSlug || "Produto Shopee";
 
       const { template_line, template_caption } = buildTemplates({
-        title: titleFallback, price: null, currency: "BRL", affiliateUrl: originalAffiliateUrl
-      });
-      res.status(200).json({
-        success: true,
-        domain: host,
-        title: titleFallback,
-        price: null,
+        title: title || "Produto Shopee",
+        price,
         currency: "BRL",
-        image: null,
-        availability: null,
-        affiliate_url: originalAffiliateUrl,
-        template_line, template_caption,
-        note: "Fallback título Shopee (HTML/slug)"
+        affiliateUrl: originalAffiliateUrl
       });
-      return;
+
+      return res.status(200).json({
+        success: true,
+        domain: "shopee.com.br",
+        title: title || "Produto Shopee",
+        price,
+        currency: "BRL",
+        affiliate_url: originalAffiliateUrl,
+        template_line,
+        template_caption
+      });
     }
 
-    // 3) Fluxo genérico (outros domínios)
-    let r = await fetch(parsed.toString(), { headers: htmlHeaders(UA_DESKTOP) });
-    if (r.status === 404 && !/^www\./i.test(parsed.hostname)) {
-      const alt = new URL(parsed); alt.hostname = `www.${parsed.hostname}`;
-      r = await fetch(alt.toString(), { headers: htmlHeaders(UA_DESKTOP) });
-      parsed = alt;
-    }
-    const status = r.status;
+    // fallback genérico
+    const r = await fetch(url, { headers: htmlHeaders(UA_DESKTOP) });
     const html = await r.text();
-    if (status >= 400) { res.status(502).json({ success: false, error: `Destino respondeu ${status}` }); return; }
-
-    const ld = parseJSONLD(html);
-    const candLd = sanitizeTitle(ld.title);
-    const candHtml = sanitizeTitle(parseTitleMeta(html));
-    const title = candLd || candHtml || "Página";
-
-    let price = ld.price ?? parseMetaPrice(html) ?? null;
-    let currency = (ld.currency || parseMetaCurrency(html) || "BRL").toUpperCase();
-    const image = ld.image || parseOgImage(html) || null;
-    const availability = ld.availability || null;
-    if (price != null && !Number.isFinite(price)) price = null;
-
-    const outURL = new URL(parsed.toString());
-    if (utm_source && !outURL.searchParams.get("utm_source")) {
-      outURL.searchParams.set("utm_source", utm_source);
-      outURL.searchParams.set("utm_medium", "referral");
-      outURL.searchParams.set("utm_campaign", "farofertas");
-    }
-    const affiliate_url = outURL.toString();
-
+    const title = sanitizeTitle(parseTitleMeta(html)) || "Página";
     const { template_line, template_caption } = buildTemplates({
-      title, price, currency, affiliateUrl: affiliate_url
-    });
-
-    res.status(200).json({
-      success: true,
-      domain: outURL.hostname,
       title,
-      price,
-      currency,
-      image,
-      availability,
-      affiliate_url,
+      price: null,
+      currency: "BRL",
+      affiliateUrl: url
+    });
+    return res.status(200).json({
+      success: true,
+      domain: u.hostname,
+      title,
+      price: null,
+      currency: "BRL",
+      affiliate_url: url,
       template_line,
       template_caption
     });
-  } catch (err) {
-    res.status(502).json({ success: false, error: err?.message || "fetch failed" });
+  } catch (e) {
+    return res.status(500).json({ success: false, error: String(e) });
   }
-}
-
 }
 
 
